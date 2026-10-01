@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { describeTaxRegime, formatCnpjInput, isValidCnpj, normalizeCnpj, normalizeDigits, parseTaxRegimeFlag } from './cnpj.js'
 import './index.css'
 
 const API_BASE = 'https://publica.cnpj.ws/cnpj'
@@ -26,36 +27,6 @@ function Icon({ name, size = 18, strokeWidth = 1.8 }) {
       {paths[name] || paths.file}
     </svg>
   )
-}
-
-function normalizeDigits(value = '') {
-  return value.replace(/\D/g, '')
-}
-
-function formatCnpjInput(value = '') {
-  const d = normalizeDigits(value).slice(0, 14)
-  return d
-    .replace(/^(\d{2})(\d)/, '$1.$2')
-    .replace(/^(\d{2})\.(\d{3})(\d)/, '$1.$2.$3')
-    .replace(/^(\d{2})\.(\d{3})\.(\d{3})(\d)/, '$1.$2.$3/$4')
-    .replace(/^(\d{2})\.(\d{3})\.(\d{3})\/(\d{4})(\d)/, '$1.$2.$3/$4-$5')
-}
-
-function isValidCnpjDigits(cnpj) {
-  const d = normalizeDigits(cnpj)
-  if (d.length !== 14 || /^([0-9])\1{13}$/.test(d)) return false
-  const calc = (base) => {
-    let factor = base.length - 7
-    let sum = 0
-    for (const n of base) {
-      sum += Number(n) * factor
-      factor = factor === 2 ? 9 : factor - 1
-    }
-    return sum % 11 < 2 ? 0 : 11 - (sum % 11)
-  }
-  const first = calc(d.slice(0, 12))
-  const second = calc(d.slice(0, 12) + first)
-  return first === Number(d[12]) && second === Number(d[13])
 }
 
 function humanizeKey(key) {
@@ -126,10 +97,8 @@ function looksLikeDate(key, value) {
 
 function formatPrimitive(value, key = '') {
   if (key === 'simples') {
-    if (value === null) return 'NÃO'
     const flag = parseTaxRegimeFlag(value)
-    if (flag !== null) return flag ? 'SIM' : 'NÃO'
-    if (value === null || value === undefined || value === '') return 'Não informado pela API'
+    return flag === null ? 'Não informado pela API' : flag ? 'SIM' : 'NÃO'
   }
   if (value === null || value === undefined || value === '') return '—'
   if (typeof value === 'boolean') return value ? 'Sim' : 'Não'
@@ -140,7 +109,7 @@ function formatPrimitive(value, key = '') {
     return d.length === 8 ? `${d.slice(0, 5)}-${d.slice(5)}` : value
   }
   if (typeof value === 'string' && /cnpj/i.test(key)) {
-    const d = normalizeDigits(value)
+    const d = normalizeCnpj(value)
     return d.length === 14 ? formatCnpjInput(d) : value
   }
   if (typeof value === 'string' && looksLikeDate(key, value)) return formatDate(value)
@@ -153,37 +122,6 @@ function countFilled(value) {
   if (Array.isArray(value)) return value.reduce((acc, item) => acc + countFilled(item), 0)
   if (typeof value === 'object') return Object.values(value).reduce((acc, item) => acc + countFilled(item), 0)
   return 1
-}
-
-function parseTaxRegimeFlag(value) {
-  if (typeof value === 'boolean') return value
-  if (typeof value !== 'string') return null
-  const normalized = value.trim().toLowerCase()
-  if (['sim', 'true', '1'].includes(normalized)) return true
-  if (['não', 'nao', 'false', '0'].includes(normalized)) return false
-  return null
-}
-
-function describeTaxRegime(value) {
-  const simple = value === null ? false : parseTaxRegimeFlag(value?.simples ?? value)
-  const mei = value === null ? false : parseTaxRegimeFlag(value?.mei)
-
-  if (mei === true) {
-    return { label: 'MEI', detail: 'Enquadramento detalhado informado pela API.' }
-  }
-  if (simple === true) {
-    return { label: 'Simples Nacional', detail: 'Enquadramento detalhado informado pela API; a empresa não está identificada como MEI.' }
-  }
-  if (simple === false && mei === false) {
-    return {
-      label: 'Lucro Presumido ou Lucro Real (indireto)',
-      detail: 'A empresa não consta como optante pelo Simples Nacional ou MEI. A API não informa qual regime de apuração se aplica.',
-    }
-  }
-  return {
-    label: 'Não identificado',
-    detail: 'A resposta da API não contém dados suficientes para determinar o regime tributário.',
-  }
 }
 
 function summarize(data) {
@@ -341,29 +279,32 @@ function App() {
   const [error, setError] = useState('')
   const [showRaw, setShowRaw] = useState(false)
   const [copied, setCopied] = useState(false)
+  const requestInFlight = useRef(false)
 
   const filledCount = useMemo(() => countFilled(data), [data])
   const summary = useMemo(() => summarize(data || {}), [data])
   const taxData = data?.simples
-  const simpleOptant = taxData === null ? false : parseTaxRegimeFlag(taxData?.simples ?? taxData)
   const taxRegime = describeTaxRegime(taxData)
 
   async function handleSubmit(event) {
     event?.preventDefault()
-    const digits = normalizeDigits(cnpj)
+    if (requestInFlight.current) return
+
+    const digits = normalizeCnpj(cnpj)
     setError('')
     setData(null)
     setCopied(false)
 
     if (digits.length !== 14) {
-      setError('Informe um CNPJ completo com 14 dígitos.')
+      setError('Informe um CNPJ completo com 14 caracteres.')
       return
     }
-    if (!isValidCnpjDigits(digits)) {
+    if (!isValidCnpj(digits)) {
       setError('O CNPJ informado não passou na validação dos dígitos verificadores.')
       return
     }
 
+    requestInFlight.current = true
     setLoading(true)
     try {
       const response = await fetch(`${API_BASE}/${digits}`, { headers: { Accept: 'application/json' } })
@@ -371,14 +312,16 @@ function App() {
       try { payload = await response.json() } catch { payload = null }
 
       if (!response.ok) {
-        if (response.status === 404) throw new Error('CNPJ não encontrado na base pública do CNPJ.ws.')
-        if (response.status === 429) throw new Error('Limite de consultas atingido. A API pública permite até 3 consultas por minuto.')
-        throw new Error(payload?.detalhes || payload?.message || `A API retornou HTTP ${response.status}.`)
+        const apiMessage = [payload?.titulo, payload?.detalhes].filter(Boolean).join(': ')
+        if (response.status === 404) throw new Error(apiMessage || 'CNPJ não encontrado na base pública do CNPJ.ws.')
+        if (response.status === 429) throw new Error(apiMessage || 'Limite de consultas atingido. Aguarde antes de tentar novamente.')
+        throw new Error(apiMessage || payload?.message || `A API retornou HTTP ${response.status}.`)
       }
       setData(payload)
     } catch (err) {
       setError(err?.message || 'Falha de comunicação com a API. Verifique sua conexão e tente novamente.')
     } finally {
+      requestInFlight.current = false
       setLoading(false)
     }
   }
@@ -412,7 +355,7 @@ function App() {
             <div className="relative flex-1">
               <label htmlFor="cnpj" className="sr-only">CNPJ</label>
               <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-500"><Icon name="building" size={19} /></span>
-              <input id="cnpj" inputMode="numeric" autoComplete="off" value={cnpj} onChange={(e) => setCnpj(formatCnpjInput(e.target.value))} onKeyDown={(e) => e.key === 'Enter' && handleSubmit(e)} placeholder="Digite o CNPJ — ex.: 27.865.757/0001-02" className="h-14 w-full rounded-2xl border soft-border bg-slate-950/40 pl-12 pr-4 text-base text-white outline-none placeholder:text-slate-600 focus:border-blue-400/50 focus:ring-4 focus:ring-blue-400/10" />
+              <input id="cnpj" inputMode="text" autoCapitalize="characters" autoComplete="off" spellCheck={false} disabled={loading} value={cnpj} onChange={(e) => setCnpj(formatCnpjInput(e.target.value))} placeholder="Digite o CNPJ — ex.: 12.ABC.345/01DE-35" className="h-14 w-full rounded-2xl border soft-border bg-slate-950/40 pl-12 pr-4 text-base text-white outline-none placeholder:text-slate-600 focus:border-blue-400/50 focus:ring-4 focus:ring-blue-400/10 disabled:cursor-wait disabled:opacity-60" />
             </div>
             <button disabled={loading} type="submit" className="inline-flex h-14 items-center justify-center gap-2 rounded-2xl bg-blue-500 px-6 text-sm font-bold text-white shadow-lg shadow-blue-950/30 transition hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-60"><Icon name="search" size={18} />{loading ? 'Consultando…' : 'Consultar'}</button>
           </div>
@@ -454,7 +397,7 @@ function App() {
               <div className="mt-4 rounded-2xl border soft-border bg-white/[0.025] p-4">
                 <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Regime tributário</p>
                 <div className="grid gap-3 md:grid-cols-2">
-                  <div className="rounded-xl border soft-border bg-slate-950/30 p-3"><p className="text-xs text-slate-500">Optante pelo Simples Nacional</p><p className="mt-1 text-sm font-semibold text-white">{simpleOptant === null ? 'Não informado pela API' : simpleOptant ? 'SIM' : 'NÃO'}</p></div>
+                  <div className="rounded-xl border soft-border bg-slate-950/30 p-3"><p className="text-xs text-slate-500">Optante pelo Simples Nacional</p><p className="mt-1 text-sm font-semibold text-white">{taxRegime.simpleOptant === null ? 'Não informado pela API' : taxRegime.simpleOptant ? 'SIM' : 'NÃO'}</p></div>
                   <div className="rounded-xl border soft-border bg-slate-950/30 p-3"><p className="text-xs text-slate-500">Enquadramento</p><p className="mt-1 text-sm font-semibold text-white">{taxRegime.label}</p><p className="mt-1 text-xs leading-5 text-slate-400">{taxRegime.detail}</p></div>
                 </div>
               </div>

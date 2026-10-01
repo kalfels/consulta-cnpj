@@ -264,6 +264,12 @@ http://localhost:5173
 npm run build
 ```
 
+### Testes
+
+```bash
+npm test
+```
+
 ### Preview do build
 
 ```bash
